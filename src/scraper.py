@@ -35,7 +35,7 @@ class WebDriverNotInitialized(Exception):
     pass
 
 def initialize_csv():
-    with open('output.csv', mode='w', newline='', encoding='utf-8') as output_file:
+    with open('output/output.csv', mode='w', newline='', encoding='utf-8') as output_file:
         writer = csv.writer(output_file)
         writer.writerow([
             'item_id',
@@ -214,7 +214,7 @@ class Scraper:
 
                     if scraped_data is not None:
                         with self.csv_write_lock:
-                            with open('output.csv', mode='a', newline='', encoding='utf-8') as output_file:
+                            with open('output/output.csv', mode='a', newline='', encoding='utf-8') as output_file:
                                 writer = csv.writer(output_file)
                                 for data in scraped_data:
                                     writer.writerow([
