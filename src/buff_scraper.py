@@ -35,11 +35,12 @@ class WebDriverNotInitialized(Exception):
     pass
 
 def initialize_csv():
-    with open('output/output.csv', mode='w', newline='', encoding='utf-8') as output_file:
+    with open('output.csv', mode='w', newline='', encoding='utf-8') as output_file:
         writer = csv.writer(output_file)
         writer.writerow([
             'item_id',
             'raw_name',
+            'name',
             'drop_down_index',
             'option_index',
             'button_text',
@@ -102,8 +103,9 @@ class Worker:
                             additional_options.append(value.text)
 
                     return_data.append({
-                        "raw_name": task['raw_name'],
                         "item_id": task['id'],
+                        "name": task['name'],
+                        "raw_name": task['raw_name'],
                         "drop_down_index": i,
                         "option_index": j,
                         "button_text": button_text,
@@ -212,21 +214,22 @@ class Scraper:
                         future = task_executor.submit(worker.scrape_data_with_timeout, item)
                         scraped_data = future.result(timeout=300)  # Set the timeout value here
 
-                    if scraped_data is not None:
-                        with self.csv_write_lock:
-                            with open('output/output.csv', mode='a', newline='', encoding='utf-8') as output_file:
-                                writer = csv.writer(output_file)
-                                for data in scraped_data:
-                                    writer.writerow([
-                                        data['item_id'],
-                                        data['raw_name'],
-                                        data['drop_down_index'],
-                                        data['option_index'],
-                                        data['button_text'],
-                                        data['option_text'],
-                                        data['option_value'],
-                                        data['additional_options']
-                                    ])
+                        if scraped_data is not None:
+                            with self.csv_write_lock:
+                                with open('output.csv', mode='a', newline='', encoding='utf-8') as output_file:
+                                    writer = csv.writer(output_file)
+                                    for data in scraped_data:
+                                        writer.writerow([
+                                            data['item_id'],
+                                            data['name'],
+                                            data['raw_name'],
+                                            data['drop_down_index'],
+                                            data['option_index'],
+                                            data['button_text'],
+                                            data['option_text'],
+                                            data['option_value'],
+                                            data['additional_options']
+                                        ])
 
                 except TimeoutError:
                     self.queue.put(item)
@@ -334,12 +337,12 @@ def main():
 
     conn = sqlite3.connect("csgo_items.db")
     cur = conn.cursor()
-    query = "SELECT buff_id, raw_name FROM (SELECT buff_id, raw_name, ROW_NUMBER() OVER (PARTITION BY name ORDER BY RANDOM()) AS rn FROM items WHERE is_stattrak = 0 AND is_souvenir = 0 AND item_type IN ('Skin', 'Knife', 'Gloves')) WHERE rn = 1"
+    query = "SELECT buff_id, raw_name, name FROM (SELECT buff_id, raw_name, name, ROW_NUMBER() OVER (PARTITION BY name ORDER BY RANDOM()) AS rn FROM items WHERE is_stattrak = 0 AND is_souvenir = 0 AND item_type IN ('Skin', 'Knife', 'Gloves')) WHERE rn = 1"
     cur.execute(query)
     items = cur.fetchall()
     initialize_csv()
     tasks = [
-        {'id': item[0], 'raw_name': item[1], 'url': f"https://buff.163.com/market/goods?goods_id={item[0]}"}
+        {'id': item[0], 'raw_name': item[1], 'name': item[2]}
         for item in items
     ]
 
