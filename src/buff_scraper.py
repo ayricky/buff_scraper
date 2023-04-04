@@ -4,8 +4,9 @@ import sqlite3
 import threading
 import time
 import traceback
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
+from queue import Queue, PriorityQueue
 import asyncio
 import aiohttp
 
@@ -27,6 +28,7 @@ from selenium.webdriver.common.proxy import Proxy, ProxyType
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from aiohttp_socks import ProxyConnector
+import itertools
 
 class MaxRetriesExceeded(Exception):
     pass
@@ -41,6 +43,8 @@ def initialize_csv():
             'item_id',
             'raw_name',
             'name',
+            'wear',
+            'skin_line',
             'drop_down_index',
             'option_index',
             'button_text',
@@ -50,12 +54,21 @@ def initialize_csv():
         ])
 
 class Worker:
+    worker_id_counter = itertools.count()  # Add a counter for unique worker IDs
+
     def __init__(self, proxy):
+        self.worker_id = next(self.worker_id_counter)  # Assign a unique ID to each worker
         self.proxy = proxy
         self.webdriver = self.init_webdriver(proxy)
         self.performance_score = 0
         self.is_working = False
         self.current_task_id = None
+
+    def __lt__(self, other):
+        return self.performance_score < other.performance_score
+
+    def __eq__(self, other):
+        return self.performance_score == other.performance_score
 
     def init_webdriver(self, proxy):
         options = webdriver.ChromeOptions()
@@ -106,6 +119,8 @@ class Worker:
                         "item_id": task['id'],
                         "name": task['name'],
                         "raw_name": task['raw_name'],
+                        "wear": task['wear'],
+                        "skin_line": task['skin_line'],
                         "drop_down_index": i,
                         "option_index": j,
                         "button_text": button_text,
@@ -114,7 +129,6 @@ class Worker:
                         "additional_options": additional_options
                     })
 
-            self.performance_score += 1  # Increase the performance score for a successful scrape
             time.sleep(2)
 
         finally:
@@ -122,32 +136,22 @@ class Worker:
             self.current_task_id = None
             return return_data
 
-    def scrape_data_with_timeout(self, task):
-        try:
-            retry = 0
-            while retry < 3:
-                try:
-                    result = self.scrape_data(task)
-                    break
-                except WebDriverException as e:
-                    retry += 1
-                    time.sleep(3)
-                except TimeoutException:
-                    raise
-            else:
-                raise MaxRetriesExceeded("Maximum retries exceeded for the task")
-        except MaxRetriesExceeded:
-            raise
-        except Exception:
-            raise
-
-        return result
+    def scrape_data_with_timeout(self, task, timeout=20):  # Add a timeout parameter
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self.scrape_data, task)
+            try:
+                return future.result(timeout=timeout)  # Add the timeout here
+            except concurrent.futures.TimeoutError:
+                future.cancel()  # Cancel the task if it times out
+                raise
 
 class Scraper:
     def __init__(self, tasks, proxies, num_workers):
-        self.queue = Queue()
+        self.task_queue = Queue()
+        self.worker_queue = PriorityQueue()
         self.csv_write_lock = threading.Lock()
-
+        self.task_queue_lock = threading.Lock()
+        self.all_tasks_done = threading.Condition(self.task_queue_lock)
         self.workers = []
 
         loop = asyncio.new_event_loop()
@@ -164,16 +168,15 @@ class Scraper:
                     worker = Worker(proxy_info)
                     if worker.webdriver is not None:
                         self.workers.append(worker)
+                        self.worker_queue.put((-worker.performance_score, worker))
                 progress.advance(create_worker_task_id)  # Update the progress bar
                 if not self.working_proxies:
                     progress.update(create_worker_task_id, completed=num_workers)  # Complete the progress bar
                     break
 
             for task in tasks:
-                self.queue.put(task)  # Add the task to the queue
+                self.task_queue.put(task)  # Add the task to the task queue
 
-            for _ in range(len(self.workers)):  # Add sentinel values for each worker
-                self.queue.put(None)
 
     async def test_proxy(self, proxy_info, progress, task_id):
         url = "https://buff.163.com/"
@@ -203,40 +206,65 @@ class Scraper:
         return working_proxies
     
     def start_scraping(self, dashboard, terminate_event):
+        sentinel = object()  # Create a sentinel object to signal that there are no more tasks to process
+
         def worker_scrape(worker):
+            nonlocal sentinel_count, sentinel_count_lock
+            queue_timeout = 10
+
             while True:
-                item = self.queue.get()
-                if item is None:
+                try:
+                    task = self.task_queue.get(timeout=queue_timeout)
+                except self.task_queue.Empty:
+                    # If the worker didn't get a task within the timeout, check if all tasks are done
+                    with sentinel_count_lock:
+                        if sentinel_count == len(self.workers):
+                            terminate_event.set()
+                    continue
+
+                if task is sentinel:
+                    self.task_queue.put(task)  # Put the sentinel back into the task_queue for other workers
+                    with sentinel_count_lock:
+                        sentinel_count += 1
+                        if sentinel_count == len(self.workers):
+                            terminate_event.set()
                     break
 
                 try:
-                    with ThreadPoolExecutor(max_workers=1) as task_executor:
-                        future = task_executor.submit(worker.scrape_data_with_timeout, item)
-                        scraped_data = future.result(timeout=300)  # Set the timeout value here
+                    scraped_data = worker.scrape_data_with_timeout(task)
 
-                        if scraped_data is not None:
-                            with self.csv_write_lock:
-                                with open('output.csv', mode='a', newline='', encoding='utf-8') as output_file:
-                                    writer = csv.writer(output_file)
-                                    for data in scraped_data:
-                                        writer.writerow([
-                                            data['item_id'],
-                                            data['name'],
-                                            data['raw_name'],
-                                            data['drop_down_index'],
-                                            data['option_index'],
-                                            data['button_text'],
-                                            data['option_text'],
-                                            data['option_value'],
-                                            data['additional_options']
-                                        ])
+                    if scraped_data is not None:
+                        with self.csv_write_lock:
+                            with open('output.csv', mode='a', newline='', encoding='utf-8') as output_file:
+                                writer = csv.writer(output_file)
+                                for data in scraped_data:
+                                    writer.writerow([
+                                        data['item_id'],
+                                        data['name'],
+                                        data['raw_name'],
+                                        data['wear'],
+                                        data['skin_line'],
+                                        data['drop_down_index'],
+                                        data['option_index'],
+                                        data['button_text'],
+                                        data['option_text'],
+                                        data['option_value'],
+                                        data['additional_options']
+                                    ])
 
-                except TimeoutError:
-                    self.queue.put(item)
+                        worker.performance_score += 1
+                        dashboard.update_progress(dashboard.completed_tasks + 1)
+                        self.task_queue.task_done()
+
+                except concurrent.futures.TimeoutError:
+                    worker.webdriver.quit()  # Quit the WebDriver instance associated with the worker
+                    self.task_queue.put(task)
+                    worker.is_working = False
+                    self.worker_queue.put((-worker.performance_score, worker))
 
                 except (WebDriverNotInitialized, Exception) as e:
                     print(f"Error occurred: {e}\nTraceback:\n{traceback.format_exc()}")
-                    self.queue.put(item)  # Re-queue the item
+                    self.task_queue.put(task)
                     if worker.webdriver is not None:
                         worker.webdriver.quit()  # Close the old webdriver
                     scraped_data = None
@@ -254,6 +282,7 @@ class Scraper:
                                 worker = new_worker
                             else:
                                 self.working_proxies = self.working_proxies[1:]  # Remove the proxy from the list if it doesn't work
+                            self.worker_queue.put((-worker.performance_score, worker))
                         except IndexError:
                             # No more proxies left
                             break
@@ -261,19 +290,29 @@ class Scraper:
                             # Failed to create a new worker, remove the proxy from the list
                             self.working_proxies = self.working_proxies[1:]
                             print(f"Error occurred while creating a new worker: {err}")
-                finally:
-                    dashboard.update_progress(dashboard.completed_tasks + 1)
 
         with ThreadPoolExecutor(max_workers=len(self.workers)) as executor:
-            tasks = [executor.submit(worker_scrape, worker) for worker in self.workers]
-            for future in as_completed(tasks):
-                future.result()
+            sentinel_count = 0
+            sentinel_count_lock = threading.Lock()
 
-            terminate_event.set() 
+            while not self.task_queue.empty() or sentinel_count < len(self.workers):
+                _, worker = self.worker_queue.get()
 
-    def close_all_drivers(self):
-        with ThreadPoolExecutor(max_workers=len(self.workers)) as executor:
-            executor.map(lambda worker: worker.webdriver.quit() if worker.webdriver else None, self.workers)
+                if not worker.is_working:
+                    worker.is_working = True
+                    executor.submit(worker_scrape, worker)
+
+            self.task_queue.join()  # Wait for all tasks to be completed
+
+            # Add sentinel values to the task_queue when there are no more tasks to process
+            if sentinel_count < len(self.workers):
+                self.task_queue.put(sentinel)
+
+                # Wait for all the workers to encounter the sentinel value
+                while sentinel_count < len(self.workers):
+                    time.sleep(1)
+
+            terminate_event.set()
 
 
 class Dashboard:
@@ -310,12 +349,18 @@ class Dashboard:
 
         header_columns = Columns([elapsed_time_text, eta_text, progress_text, tasks_in_queue_text])
 
-        self.table = Table("Worker", "Status", "Task ID", "Performance Score", title=header_columns)
+        # Sort the workers by performance score
+        sorted_workers = sorted(self.workers, key=lambda w: w.performance_score, reverse=True)
+
+        self.table = Table("Worker ID", "Status", "Task ID", "Performance Score", title=header_columns)
         self.table.style = "bold blue"  # Set the table style
-        for i, worker in enumerate(self.workers):
+
+        # Display workers in the table based on their sorted performance score
+        for worker in sorted_workers:
             status = "Working" if worker.is_working else "Idle"
             task_id = str(worker.current_task_id) if worker.current_task_id else "N/A"
-            self.table.add_row(str(i + 1), status, task_id, str(worker.performance_score))
+            self.table.add_row(str(worker.worker_id), status, task_id, str(worker.performance_score))
+
 
     def update_progress(self, completed_tasks):
         self.completed_tasks = completed_tasks
@@ -337,12 +382,17 @@ def main():
 
     conn = sqlite3.connect("csgo_items.db")
     cur = conn.cursor()
-    query = "SELECT buff_id, raw_name, name FROM (SELECT buff_id, raw_name, name, ROW_NUMBER() OVER (PARTITION BY name ORDER BY RANDOM()) AS rn FROM items WHERE is_stattrak = 0 AND is_souvenir = 0 AND item_type IN ('Skin', 'Knife', 'Gloves')) WHERE rn = 1"
+    query = """SELECT buff_id, raw_name, name, wear, skin_line FROM (
+                SELECT buff_id, raw_name, name, wear, skin_line,
+                ROW_NUMBER() OVER (PARTITION BY name ORDER BY RANDOM()) AS rn
+                FROM items
+                WHERE is_stattrak = 0 AND is_souvenir = 0 AND item_type IN ('Skin', 'Knife', 'Gloves')
+          ) WHERE rn = 1"""
     cur.execute(query)
     items = cur.fetchall()
     initialize_csv()
     tasks = [
-        {'id': item[0], 'raw_name': item[1], 'name': item[2]}
+        {'id': item[0], 'raw_name': item[1], 'name': item[2], 'wear': item[3], 'skin_line': item[4]}
         for item in items
     ]
 
@@ -361,7 +411,7 @@ def main():
     dashboard.update_table()
     dashboard.console.print(Panel(dashboard.table))
 
-    # Close all drivers
+    # Close all drivers with a progress bar
     scraper.close_all_drivers()
     conn.close()
 
