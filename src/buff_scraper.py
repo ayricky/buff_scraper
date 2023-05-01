@@ -42,7 +42,7 @@ def initialize_csv():
         writer = csv.writer(output_file)
         writer.writerow(
             [
-                "item_id",
+                "buff_id",
                 "raw_name",
                 "name",
                 "wear",
@@ -122,7 +122,7 @@ class Worker:
 
                     return_data.append(
                         {
-                            "item_id": task["id"],
+                            "buff_id": task["id"],
                             "name": task["name"],
                             "raw_name": task["raw_name"],
                             "wear": task["wear"],
@@ -254,7 +254,7 @@ class Scraper:
                             for data in scraped_data:
                                 writer.writerow(
                                     [
-                                        data["item_id"],
+                                        data["buff_id"],
                                         data["name"],
                                         data["raw_name"],
                                         data["wear"],
